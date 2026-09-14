@@ -1,0 +1,109 @@
+name: Train Stem Separator (self-hosted GPU)
+
+# GitHub's free-tier runners have no GPU, and this job needs one — real
+# source-separation training on CPU would take days, not hours, even for
+# the lightweight model. This workflow instead targets a SELF-HOSTED
+# runner: a GPU machine you register to this repo yourself (your own PC, or
+# a rented cloud GPU box). GitHub Actions still triggers it automatically
+# on push (or on a manual click) — it just runs on your hardware instead of
+# GitHub's. See training/stem_separator/README.md "Automating this with
+# GitHub Actions" for how to register one; until you have, this workflow
+# will sit queued forever with no runner able to pick it up (that's
+# expected, not a bug).
+#
+# Manual trigger only, on purpose — this is a multi-hour job even on a
+# decent GPU, and dataset downloads/training runs aren't something you want
+# kicking off unattended on every push. Switch the trigger to `push:` below
+# once you trust the setup, if you want that.
+
+on:
+  workflow_dispatch:
+    inputs:
+      epochs:
+        description: 'Training epochs'
+        required: false
+        default: '50'
+      batch_size:
+        description: 'Batch size'
+        required: false
+        default: '4'
+
+jobs:
+  train:
+    runs-on: [self-hosted, gpu] # requires a self-hosted runner registered with the "gpu" label — see README
+    timeout-minutes: 1440 # 24h ceiling — a real training run can legitimately take this long
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Confirm GPU is visible
+        run: nvidia-smi
+
+      # Assumes torch/torchaudio/musdb/museval/ai-edge-torch are already
+      # installed on this self-hosted machine (a one-time setup step, not
+      # something to repeat on every run) — see the README for the install
+      # command. Re-installing on every job run would waste real time on a
+      # box you're paying for (or waiting on).
+
+      - name: Locate or download MUSDB18
+        env:
+          MUSDB_CACHE: ${{ runner.tool_cache }}/musdb18
+        run: |
+          mkdir -p "$MUSDB_CACHE"
+          if [ -z "$(ls -A "$MUSDB_CACHE")" ]; then
+            echo "MUSDB18 not cached on this runner yet — downloading once."
+            echo "Check https://sigsep.github.io/datasets/musdb.html for the current URL if this has moved."
+            wget -O /tmp/musdb18.zip "https://zenodo.org/record/1117372/files/musdb18.zip"
+            unzip -q /tmp/musdb18.zip -d "$MUSDB_CACHE"
+          else
+            echo "Using cached MUSDB18 at $MUSDB_CACHE"
+          fi
+          echo "MUSDB_ROOT=$MUSDB_CACHE" >> "$GITHUB_ENV"
+
+      - name: Train
+        working-directory: training/stem_separator
+        env:
+          EPOCHS: ${{ github.event.inputs.epochs || '50' }}
+          BATCH_SIZE: ${{ github.event.inputs.batch_size || '4' }}
+        run: |
+          python3 lightweight_unet.py \
+            --musdb-root "$MUSDB_ROOT" \
+            --epochs "$EPOCHS" \
+            --batch-size "$BATCH_SIZE" \
+            --checkpoint-path lightweight_unet.pt
+
+      - name: Export to TFLite
+        working-directory: training/stem_separator
+        run: |
+          python3 export_to_tflite.py \
+            --checkpoint lightweight_unet.pt \
+            --output stem_separator.tflite \
+            --chunk-samples 352800
+
+      - name: Copy model into the Android project's assets
+        run: |
+          mkdir -p app/src/main/assets/models
+          cp training/stem_separator/stem_separator.tflite app/src/main/assets/models/stem_separator.tflite
+
+      - name: Upload training artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: stem-separator-model
+          path: |
+            training/stem_separator/stem_separator.tflite
+            training/stem_separator/lightweight_unet.pt
+
+      - name: Commit updated model, if it changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet -- app/src/main/assets/models/stem_separator.tflite; then
+            git add app/src/main/assets/models/stem_separator.tflite
+            git commit -m "Retrain stem_separator (self-hosted GPU) [automated] [skip ci]"
+            git push
+          else
+            echo "No change in trained model — nothing to commit."
+          fi

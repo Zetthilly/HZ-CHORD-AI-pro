@@ -1,1 +1,57 @@
+name: Android Build
 
+# Builds the app on every push/PR that touches Android source, plus manual
+# runs. Uses gradle/actions/setup-gradle to provision Gradle itself, so this
+# doesn't depend on a checked-in gradlew wrapper (Android Studio will
+# generate one for local use the first time you open the project — see the
+# project README).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'app/**'
+      - 'core-audio/**'
+      - 'core-ui/**'
+      - 'feature-*/**'
+      - 'build.gradle.kts'
+      - 'settings.gradle.kts'
+      - 'gradle.properties'
+      - '.github/workflows/android-build.yml'
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Assemble debug APK
+        run: gradle assembleDebug --stacktrace
+
+      - name: Run unit tests
+        run: gradle testDebugUnitTest --stacktrace
+        continue-on-error: true # no unit tests exist yet — don't fail CI over an empty test task
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ichi-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn

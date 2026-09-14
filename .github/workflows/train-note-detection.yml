@@ -1,0 +1,74 @@
+name: Train Note-Detection Model
+
+# This one genuinely trains: numpy/scikit-learn on a GitHub-hosted CPU
+# runner is enough for the 12 -> 32 -> 12 pitch-class MLP (same pipeline
+# documented in training/note_detection/README.md). Runs whenever that
+# folder changes, so the embedded model in the app stays in sync with the
+# training code that produced it — and can be re-run manually any time to
+# regenerate it (e.g. after tweaking synth_dataset.py's parameters).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'training/note_detection/**'
+      - '.github/workflows/train-note-detection.yml'
+  workflow_dispatch: {}
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # needed to commit the retrained weights back
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install numpy scipy scikit-learn
+
+      - name: Sanity-check the synthetic data generator
+        working-directory: training/note_detection
+        run: python3 synth_dataset.py
+
+      - name: Train
+        working-directory: training/note_detection
+        run: python3 train_mlp.py | tee training_run_log.txt
+
+      - name: Export weights to Kotlin
+        working-directory: training/note_detection
+        run: python3 export_weights_to_kotlin.py
+
+      - name: Copy trained model into the Android project
+        run: |
+          cp training/note_detection/TrainedPitchClassifier.kt \
+             core-audio/src/main/java/com/zetthilly/ichi/core/theory/TrainedPitchClassifier.kt
+
+      - name: Upload training artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: trained-pitch-classifier
+          path: |
+            training/note_detection/TrainedPitchClassifier.kt
+            training/note_detection/trained_weights.npz
+            training/note_detection/training_run_log.txt
+
+      - name: Commit updated model, if it changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet -- core-audio/src/main/java/com/zetthilly/ichi/core/theory/TrainedPitchClassifier.kt training/note_detection/trained_weights.npz training/note_detection/training_run_log.txt; then
+            git add core-audio/src/main/java/com/zetthilly/ichi/core/theory/TrainedPitchClassifier.kt \
+                    training/note_detection/trained_weights.npz \
+                    training/note_detection/training_run_log.txt
+            git commit -m "Retrain note-detection pitch classifier [automated] [skip ci]"
+            git push
+          else
+            echo "No change in trained weights — nothing to commit."
+          fi

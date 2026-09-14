@@ -1,0 +1,74 @@
+name: Training Pipelines Smoke Test
+
+# IMPORTANT — read before trusting this workflow's green checkmark:
+# This does NOT produce usable models. GitHub's free-tier runners have no
+# GPU, and the stem-separator pipeline needs the real MUSDB18 dataset (~30GB)
+# which isn't available here. What this DOES do: catch broken code early —
+# import errors, shape mismatches, API drift in torch/torchaudio/pretty_midi
+# — on a tiny synthetic slice, in CPU minutes instead of finding out after a
+# multi-hour real run on Colab. Real training still has to happen where
+# training/README.md says it does (Colab / your own GPU machine).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'training/note_detector/**'
+      - 'training/stem_separator/**'
+      - '.github/workflows/train-heavy-smoke-test.yml'
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  note_detector_smoke_test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install CPU-only torch + deps
+        run: |
+          pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+          pip install pretty_midi soundfile numpy
+
+      - name: Generate a tiny synthetic dataset (1 example per combo, not the real 20)
+        working-directory: training/note_detector
+        run: python3 generate_synthetic_arpeggios.py --output_dir /tmp/smoke_data --examples_per_combo 1
+
+      - name: Train for 1 epoch (correctness check, not a real training run)
+        working-directory: training/note_detector
+        run: python3 train.py --data_dir /tmp/smoke_data --epochs 1 --batch_size 4 --output /tmp/smoke_checkpoint.pt
+
+      - name: Confirm a checkpoint was written
+        run: test -f /tmp/smoke_checkpoint.pt && echo "OK — training loop runs end-to-end"
+
+  stem_separator_smoke_test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install CPU-only torch
+        run: pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Forward-pass smoke test (no MUSDB18 available in CI, so this checks the model builds and runs, not that it trains well)
+        working-directory: training/stem_separator
+        run: |
+          python3 -c "
+          import torch
+          from lightweight_unet import LightweightSeparatorUNet, stft_mag_phase
+
+          model = LightweightSeparatorUNet()
+          dummy_waveform = torch.randn(1, 44100 * 2)  # 2 seconds of noise
+          mag, phase = stft_mag_phase(dummy_waveform)
+          masks = model(mag.unsqueeze(1))
+          assert masks.shape[1] == 4, f'expected 4 stem masks, got {masks.shape[1]}'
+          print('OK — model builds and forward pass runs, output shape:', masks.shape)
+          "
