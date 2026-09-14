@@ -1,0 +1,12 @@
+Generating 20000 training examples...
+Generating 4000 held-out test examples...
+Training MLP (12 -> 32 -> 12)...
+Output activation used by sklearn: logistic
+
+--- Held-out test set metrics ---
+Exact-match (all pitch classes correct) accuracy: 0.746
+Per-label micro F1: 0.9301803066898837
+Per-label macro F1: 0.9310888835677092
+Hamming loss (fraction of individual pitch-class labels wrong): 0.025895833333333333
+
+Saved trained_weights.npz
