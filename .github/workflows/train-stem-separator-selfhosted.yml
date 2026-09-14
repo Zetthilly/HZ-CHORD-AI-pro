@@ -33,7 +33,7 @@ jobs:
     env:
       MUSDB_URL: https://zenodo.org/records/1117372/files/musdb18.zip
       MUSDB_SHA256: ''
-      MUSDB_CACHE: ${{ runner.tool_cache }}/musdb18
+      MUSDB_CACHE: ${{ github.workspace }}/.cache/musdb18
       PYTHONUNBUFFERED: '1'
 
     steps:
