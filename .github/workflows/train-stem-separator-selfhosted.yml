@@ -1,109 +1,189 @@
 name: Train Stem Separator (self-hosted GPU)
 
-# GitHub's free-tier runners have no GPU, and this job needs one — real
-# source-separation training on CPU would take days, not hours, even for
-# the lightweight model. This workflow instead targets a SELF-HOSTED
-# runner: a GPU machine you register to this repo yourself (your own PC, or
-# a rented cloud GPU box). GitHub Actions still triggers it automatically
-# on push (or on a manual click) — it just runs on your hardware instead of
-# GitHub's. See training/stem_separator/README.md "Automating this with
-# GitHub Actions" for how to register one; until you have, this workflow
-# will sit queued forever with no runner able to pick it up (that's
-# expected, not a bug).
-#
-# Manual trigger only, on purpose — this is a multi-hour job even on a
-# decent GPU, and dataset downloads/training runs aren't something you want
-# kicking off unattended on every push. Switch the trigger to `push:` below
-# once you trust the setup, if you want that.
-
 on:
   workflow_dispatch:
     inputs:
       epochs:
-        description: 'Training epochs'
+        description: Training epochs
         required: false
         default: '50'
       batch_size:
-        description: 'Batch size'
+        description: Batch size
         required: false
-        default: '4'
+        default: '2'
+      segments_per_track:
+        description: Random training segments per track
+        required: false
+        default: '20'
+      resume:
+        description: Resume from the previous checkpoint
+        required: false
+        type: boolean
+        default: true
 
 jobs:
   train:
-    runs-on: [self-hosted, gpu] # requires a self-hosted runner registered with the "gpu" label — see README
-    timeout-minutes: 1440 # 24h ceiling — a real training run can legitimately take this long
+    # The runner must have BOTH labels. GitHub-hosted ubuntu runners do not
+    # satisfy this and do not provide the required GPU.
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 1440
     permissions:
       contents: write
 
+    env:
+      MUSDB_URL: https://zenodo.org/records/1117372/files/musdb18.zip
+      MUSDB_SHA256: ''
+      MUSDB_CACHE: ${{ runner.tool_cache }}/musdb18
+      PYTHONUNBUFFERED: '1'
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Confirm GPU is visible
-        run: nvidia-smi
+      - name: Restore training checkpoint cache
+        uses: actions/cache@v4
+        with:
+          path: training/stem_separator/checkpoints
+          key: stem-separator-checkpoint-${{ runner.os }}-${{ github.ref_name }}
+          restore-keys: |
+            stem-separator-checkpoint-${{ runner.os }}-
 
-      # Assumes torch/torchaudio/musdb/museval/ai-edge-torch are already
-      # installed on this self-hosted machine (a one-time setup step, not
-      # something to repeat on every run) — see the README for the install
-      # command. Re-installing on every job run would waste real time on a
-      # box you're paying for (or waiting on).
-
-      - name: Locate or download MUSDB18
-        env:
-          MUSDB_CACHE: ${{ runner.tool_cache }}/musdb18
+      - name: Verify GPU and disk
+        shell: bash
         run: |
+          set -euo pipefail
+          nvidia-smi
+          python3 --version
+          df -h . "$RUNNER_TOOL_CACHE" || true
+
+      - name: Create Python environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/hz-stem-venv"
+          source "$RUNNER_TEMP/hz-stem-venv/bin/activate"
+          python -m pip install --upgrade pip setuptools wheel
+          # PyTorch should normally come from the runner's CUDA environment.
+          # Installing requirements here also makes a fresh runner reproducible.
+          pip install -r training/stem_separator/requirements.txt
+          ffmpeg_bin=$(python -c 'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())')
+          echo "$(dirname "$ffmpeg_bin")" >> "$GITHUB_PATH"
+          python - <<'PY'
+          import torch
+          print('torch:', torch.__version__)
+          print('CUDA:', torch.cuda.is_available())
+          if not torch.cuda.is_available():
+              raise SystemExit('CUDA is not available to this runner')
+          print('GPU:', torch.cuda.get_device_name(0))
+          import litert_torch
+          print('litert_torch:', getattr(litert_torch, '__version__', 'installed'))
+          PY
+          echo "$RUNNER_TEMP/hz-stem-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Prepare MUSDB18 cache
+        shell: bash
+        run: |
+          set -euo pipefail
           mkdir -p "$MUSDB_CACHE"
-          if [ -z "$(ls -A "$MUSDB_CACHE")" ]; then
-            echo "MUSDB18 not cached on this runner yet — downloading once."
-            echo "Check https://sigsep.github.io/datasets/musdb.html for the current URL if this has moved."
-            wget -O /tmp/musdb18.zip "https://zenodo.org/record/1117372/files/musdb18.zip"
-            unzip -q /tmp/musdb18.zip -d "$MUSDB_CACHE"
+          marker="$MUSDB_CACHE/.ready"
+          if [ ! -f "$marker" ]; then
+            rm -rf "$MUSDB_CACHE"/*
+            archive="$RUNNER_TEMP/musdb18.zip"
+            echo "Downloading MUSDB18 from Zenodo..."
+            curl -L --fail --retry 5 --retry-delay 5 -o "$archive" "$MUSDB_URL"
+            if [ -n "$MUSDB_SHA256" ]; then
+              echo "$MUSDB_SHA256  $archive" | sha256sum -c -
+            fi
+            unzip -q "$archive" -d "$MUSDB_CACHE"
+            # The official archive may contain a top-level musdb18 directory.
+            if [ -d "$MUSDB_CACHE/musdb18/train" ]; then
+              root="$MUSDB_CACHE/musdb18"
+            elif [ -d "$MUSDB_CACHE/train" ]; then
+              root="$MUSDB_CACHE"
+            else
+              echo 'Could not find MUSDB18/train after extraction:'
+              find "$MUSDB_CACHE" -maxdepth 3 -type d | head -50
+              exit 1
+            fi
+            printf '%s\n' "$root" > "$MUSDB_CACHE/root.txt"
+            touch "$marker"
           else
-            echo "Using cached MUSDB18 at $MUSDB_CACHE"
+            echo 'Using cached MUSDB18.'
           fi
-          echo "MUSDB_ROOT=$MUSDB_CACHE" >> "$GITHUB_ENV"
+          root="$(cat "$MUSDB_CACHE/root.txt")"
+          test -d "$root/train"
+          echo "MUSDB_ROOT=$root" >> "$GITHUB_ENV"
+          echo "MUSDB_ROOT=$root"
 
-      - name: Train
-        working-directory: training/stem_separator
+      - name: Train or resume
+        shell: bash
         env:
-          EPOCHS: ${{ github.event.inputs.epochs || '50' }}
-          BATCH_SIZE: ${{ github.event.inputs.batch_size || '4' }}
+          EPOCHS: ${{ inputs.epochs }}
+          BATCH_SIZE: ${{ inputs.batch_size }}
+          SEGMENTS: ${{ inputs.segments_per_track }}
+          RESUME: ${{ inputs.resume }}
         run: |
-          python3 lightweight_unet.py \
+          set -euo pipefail
+          mkdir -p training/stem_separator/checkpoints
+          ckpt=training/stem_separator/checkpoints/lightweight_unet.pt
+          resume_arg=''
+          if [ "$RESUME" = 'true' ] && [ -f "$ckpt" ]; then
+            resume_arg="--resume-from $ckpt"
+          fi
+          python training/stem_separator/lightweight_unet.py \
             --musdb-root "$MUSDB_ROOT" \
             --epochs "$EPOCHS" \
             --batch-size "$BATCH_SIZE" \
-            --checkpoint-path lightweight_unet.pt
+            --segments-per-track "$SEGMENTS" \
+            --num-workers 2 \
+            --checkpoint-path "$ckpt" \
+            $resume_arg
 
-      - name: Export to TFLite
-        working-directory: training/stem_separator
+      - name: Export and validate LiteRT model
+        shell: bash
         run: |
-          python3 export_to_tflite.py \
-            --checkpoint lightweight_unet.pt \
-            --output stem_separator.tflite \
+          set -euo pipefail
+          python training/stem_separator/export_to_tflite.py \
+            --checkpoint training/stem_separator/checkpoints/lightweight_unet.pt \
+            --output training/stem_separator/stem_separator.tflite \
             --chunk-samples 352800
 
-      - name: Copy model into the Android project's assets
+      - name: Verify TFLite artifact
+        shell: bash
         run: |
+          set -euo pipefail
+          test -s training/stem_separator/stem_separator.tflite
+          ls -lh training/stem_separator/stem_separator.tflite
+
+      - name: Install model into Android assets
+        shell: bash
+        run: |
+          set -euo pipefail
           mkdir -p app/src/main/assets/models
           cp training/stem_separator/stem_separator.tflite app/src/main/assets/models/stem_separator.tflite
 
       - name: Upload training artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: stem-separator-model
+          name: stem-separator-model-${{ github.run_number }}
+          if-no-files-found: error
           path: |
             training/stem_separator/stem_separator.tflite
-            training/stem_separator/lightweight_unet.pt
+            training/stem_separator/checkpoints/lightweight_unet.pt
+            training/stem_separator/checkpoints/lightweight_unet_best.pt
 
-      - name: Commit updated model, if it changed
+      - name: Commit validated model to repository
+        shell: bash
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          if ! git diff --quiet -- app/src/main/assets/models/stem_separator.tflite; then
-            git add app/src/main/assets/models/stem_separator.tflite
-            git commit -m "Retrain stem_separator (self-hosted GPU) [automated] [skip ci]"
-            git push
-          else
-            echo "No change in trained model — nothing to commit."
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add app/src/main/assets/models/stem_separator.tflite
+          if git diff --cached --quiet; then
+            echo 'No model change to commit.'
+            exit 0
           fi
+          git commit -m 'Update validated stem separator model [skip ci]'
+          git push origin HEAD:${GITHUB_REF_NAME}
