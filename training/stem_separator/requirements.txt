@@ -1,0 +1,7 @@
+torch>=2.6
+torchaudio>=2.6
+musdb>=0.4.2
+stempeg>=0.2.3
+numpy>=1.26
+litert-torch>=0.9.4
+imageio-ffmpeg>=0.6

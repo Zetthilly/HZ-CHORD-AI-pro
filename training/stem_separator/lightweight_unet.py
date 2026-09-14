@@ -1,173 +1,253 @@
+"""Train a compact 4-stem waveform separator for HZ-CHORD-AI.
+
+The exported model is intentionally waveform-in / waveform-out so it matches
+feature-stems/TFLiteStemSeparator.kt exactly:
+    input  [1, 352800]
+    output [1, 4, 352800]
+
+MUSDB18 provides the four targets: drums, bass, other, vocals.
 """
-A compact spectrogram-masking U-Net for 4-stem source separation
-(drums/bass/other/vocals) — much smaller than Demucs, meant as a genuine,
-tractable from-scratch training project rather than a Demucs replacement.
+from __future__ import annotations
 
-Requires: torch, torchaudio, musdb, museval
-    pip install torch torchaudio musdb museval
-
-Requires the MUSDB18 dataset: https://sigsep.github.io/datasets/musdb.html
-(150 songs, ~30GB, isolated stems). This script expects it unpacked at
---musdb-root with the standard musdb directory layout.
-
-NOT executed in the sandbox that produced this file — no GPU, no torch, no
-dataset available there. Run this on Colab or a machine with a CUDA GPU.
-
-    python3 lightweight_unet.py --musdb-root /path/to/musdb18 --epochs 50
-"""
 import argparse
+import os
+import random
+from pathlib import Path
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 STEMS = ["drums", "bass", "other", "vocals"]
-N_FFT = 2048
-HOP_LENGTH = 512
-SEGMENT_SECONDS = 6
-SAMPLE_RATE = 44100
+SAMPLE_RATE = 44_100
+SEGMENT_SECONDS = 8
+SEGMENT_SAMPLES = SAMPLE_RATE * SEGMENT_SECONDS  # 352800; Android contract
 
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_ch, out_ch):
+class ConvBlock1D(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch),
+        self.net = nn.Sequential(
+            nn.Conv1d(in_ch, out_ch, kernel_size=7, padding=3),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch),
+            nn.Conv1d(out_ch, out_ch, kernel_size=7, padding=3),
             nn.ReLU(inplace=True),
         )
 
-    def forward(self, x):
-        return self.conv(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
 
 class LightweightSeparatorUNet(nn.Module):
-    """
-    Operates on a mono magnitude spectrogram and predicts one soft mask per
-    stem (values in [0,1]); the mask is applied to the input spectrogram's
-    magnitude, then combined with the original phase for reconstruction.
-    This is the same general approach as Open-Unmix, at a smaller scale.
+    """Small waveform U-Net: mono mixture -> 4 mono stems.
+
+    It uses only standard 1-D convolutions, ReLU, GroupNorm and interpolation,
+    which keeps the graph much friendlier to PyTorch -> LiteRT conversion than
+    the previous STFT/iSTFT-in-the-model design.
     """
 
-    def __init__(self, n_stems: int = len(STEMS), base_channels: int = 16):
+    def __init__(self, n_stems: int = 4, base_channels: int = 8):
         super().__init__()
-        self.enc1 = ConvBlock(1, base_channels)
-        self.enc2 = ConvBlock(base_channels, base_channels * 2)
-        self.enc3 = ConvBlock(base_channels * 2, base_channels * 4)
-        self.pool = nn.MaxPool2d(2)
+        self.enc1 = ConvBlock1D(1, base_channels)
+        self.down1 = nn.Conv1d(base_channels, base_channels * 2, 8, stride=2, padding=3)
+        self.enc2 = ConvBlock1D(base_channels * 2, base_channels * 2)
+        self.down2 = nn.Conv1d(base_channels * 2, base_channels * 4, 8, stride=2, padding=3)
+        self.enc3 = ConvBlock1D(base_channels * 4, base_channels * 4)
+        self.down3 = nn.Conv1d(base_channels * 4, base_channels * 8, 8, stride=2, padding=3)
+        self.bottleneck = ConvBlock1D(base_channels * 8, base_channels * 8)
 
-        self.bottleneck = ConvBlock(base_channels * 4, base_channels * 8)
+        self.dec3 = ConvBlock1D(base_channels * 8 + base_channels * 4, base_channels * 4)
+        self.dec2 = ConvBlock1D(base_channels * 4 + base_channels * 2, base_channels * 2)
+        self.dec1 = ConvBlock1D(base_channels * 2 + base_channels, base_channels)
+        self.head = nn.Conv1d(base_channels, n_stems, kernel_size=1)
 
-        self.up3 = nn.ConvTranspose2d(base_channels * 8, base_channels * 4, 2, stride=2)
-        self.dec3 = ConvBlock(base_channels * 8, base_channels * 4)
-        self.up2 = nn.ConvTranspose2d(base_channels * 4, base_channels * 2, 2, stride=2)
-        self.dec2 = ConvBlock(base_channels * 4, base_channels * 2)
-        self.up1 = nn.ConvTranspose2d(base_channels * 2, base_channels, 2, stride=2)
-        self.dec1 = ConvBlock(base_channels * 2, base_channels)
+    @staticmethod
+    def _up(x: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return F.interpolate(x, size=target.shape[-1], mode="linear", align_corners=False)
 
-        self.mask_head = nn.Conv2d(base_channels, n_stems, 1)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, 1, N]
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.down1(e1))
+        e3 = self.enc3(self.down2(e2))
+        b = self.bottleneck(self.down3(e3))
 
-    def forward(self, spec_mag: torch.Tensor) -> torch.Tensor:
-        # spec_mag: [batch, 1, freq_bins, time_frames]
-        e1 = self.enc1(spec_mag)
-        e2 = self.enc2(self.pool(e1))
-        e3 = self.enc3(self.pool(e2))
-        b = self.bottleneck(self.pool(e3))
-
-        d3 = self.dec3(torch.cat([self.up3(b), e3], dim=1))
-        d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
-        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
-
-        masks = torch.sigmoid(self.mask_head(d1))  # [batch, n_stems, freq, time]
-        return masks
-
-
-def stft_mag_phase(waveform: torch.Tensor):
-    spec = torch.stft(
-        waveform, n_fft=N_FFT, hop_length=HOP_LENGTH,
-        window=torch.hann_window(N_FFT, device=waveform.device),
-        return_complex=True,
-    )
-    return spec.abs(), torch.angle(spec)
+        d3 = self.dec3(torch.cat([self._up(b, e3), e3], dim=1))
+        d2 = self.dec2(torch.cat([self._up(d3, e2), e2], dim=1))
+        d1 = self.dec1(torch.cat([self._up(d2, e1), e1], dim=1))
+        # tanh bounds the generated audio and avoids runaway output levels.
+        return torch.tanh(self.head(d1))
 
 
-def istft_from_mag_phase(mag: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
-    complex_spec = torch.polar(mag, phase)
-    return torch.istft(
-        complex_spec, n_fft=N_FFT, hop_length=HOP_LENGTH,
-        window=torch.hann_window(N_FFT, device=mag.device),
-    )
+class MusdbSegmentDataset(Dataset):
+    """Random fixed-length segments decoded lazily from MUSDB18."""
 
-
-class MusdbSegmentDataset(torch.utils.data.Dataset):
-    """Loads random SEGMENT_SECONDS-long mixture/stem pairs from MUSDB18 via the `musdb` package."""
-
-    def __init__(self, musdb_root: str, subset: str = "train", segments_per_track: int = 20):
+    def __init__(
+        self,
+        musdb_root: str,
+        subset: str = "train",
+        segments_per_track: int = 20,
+        max_tracks: int = 0,
+    ):
         import musdb
-        self.mus = musdb.DB(root=musdb_root, subsets=subset)
+
+        self.mus = musdb.DB(root=musdb_root, subsets=subset, is_wav=False)
+        tracks = list(self.mus.tracks)
+        if max_tracks > 0:
+            tracks = tracks[:max_tracks]
+        if not tracks:
+            raise RuntimeError(f"No MUSDB tracks found in {musdb_root!r} subset={subset!r}")
+        self.tracks = tracks
         self.segments_per_track = segments_per_track
-        self.segment_len = SEGMENT_SECONDS * SAMPLE_RATE
+        self.segment_len = SEGMENT_SAMPLES
 
-    def __len__(self):
-        return len(self.mus.tracks) * self.segments_per_track
+    def __len__(self) -> int:
+        return len(self.tracks) * self.segments_per_track
 
-    def __getitem__(self, idx):
-        track = self.mus.tracks[idx % len(self.mus.tracks)]
-        max_start = max(0, track.audio.shape[0] - self.segment_len)
-        start = torch.randint(0, max(1, max_start), (1,)).item()
+    def __getitem__(self, idx: int):
+        track = self.tracks[idx % len(self.tracks)]
+        total = int(track.audio.shape[0])
+        max_start = max(0, total - self.segment_len)
+        start = random.randint(0, max_start) if max_start else 0
+        end = start + self.segment_len
 
-        mixture = track.audio[start:start + self.segment_len].mean(axis=1)  # downmix to mono
-        stems = [track.targets[name].audio[start:start + self.segment_len].mean(axis=1) for name in STEMS]
+        mixture = np.asarray(track.audio[start:end], dtype=np.float32)
+        mixture = mixture.mean(axis=1) if mixture.ndim == 2 else mixture
 
-        mixture_t = torch.tensor(mixture, dtype=torch.float32)
-        stems_t = torch.stack([torch.tensor(s, dtype=torch.float32) for s in stems])
-        return mixture_t, stems_t
+        stem_arrays = []
+        for name in STEMS:
+            audio = np.asarray(track.targets[name].audio[start:end], dtype=np.float32)
+            audio = audio.mean(axis=1) if audio.ndim == 2 else audio
+            if len(audio) < self.segment_len:
+                audio = np.pad(audio, (0, self.segment_len - len(audio)))
+            stem_arrays.append(audio[: self.segment_len])
+
+        if len(mixture) < self.segment_len:
+            mixture = np.pad(mixture, (0, self.segment_len - len(mixture)))
+        mixture = mixture[: self.segment_len]
+        return torch.from_numpy(mixture), torch.from_numpy(np.stack(stem_arrays, axis=0))
+
+
+def spectral_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Cheap spectral magnitude loss used alongside waveform L1."""
+    n_fft = 1024
+    hop = 256
+    window = torch.hann_window(n_fft, device=pred.device)
+    pred_s = torch.stft(pred.reshape(-1, pred.shape[-1]), n_fft=n_fft, hop_length=hop,
+                        window=window, return_complex=True).abs()
+    tgt_s = torch.stft(target.reshape(-1, target.shape[-1]), n_fft=n_fft, hop_length=hop,
+                        window=window, return_complex=True).abs()
+    return F.l1_loss(torch.log1p(pred_s), torch.log1p(tgt_s))
+
+
+def save_checkpoint(path: str, model, optimizer, scheduler, epoch, best_loss):
+    tmp = path + ".tmp"
+    torch.save({
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict() if scheduler else None,
+        "epoch": epoch,
+        "best_loss": best_loss,
+        "stems": STEMS,
+        "sample_rate": SAMPLE_RATE,
+        "segment_samples": SEGMENT_SAMPLES,
+    }, tmp)
+    os.replace(tmp, path)
+
+
+def load_checkpoint(path, model, optimizer=None, scheduler=None, device="cpu"):
+    ckpt = torch.load(path, map_location=device)
+    state = ckpt.get("model", ckpt)
+    model.load_state_dict(state)
+    if optimizer is not None and ckpt.get("optimizer"):
+        optimizer.load_state_dict(ckpt["optimizer"])
+    if scheduler is not None and ckpt.get("scheduler"):
+        scheduler.load_state_dict(ckpt["scheduler"])
+    return int(ckpt.get("epoch", 0)), float(ckpt.get("best_loss", float("inf")))
 
 
 def train(args):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Training on {device}")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA GPU not available. This workflow is intentionally GPU-only.")
 
-    dataset = MusdbSegmentDataset(args.musdb_root, subset="train")
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+    device = torch.device("cuda")
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    torch.backends.cudnn.benchmark = True
+
+    dataset = MusdbSegmentDataset(
+        args.musdb_root,
+        subset="train",
+        segments_per_track=args.segments_per_track,
+        max_tracks=args.max_tracks,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+        drop_last=True,
+    )
 
     model = LightweightSeparatorUNet().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.epochs))
+    scaler = torch.amp.GradScaler("cuda", enabled=not args.no_amp)
 
-    for epoch in range(args.epochs):
+    start_epoch = 0
+    best_loss = float("inf")
+    if args.resume_from and Path(args.resume_from).exists():
+        start_epoch, best_loss = load_checkpoint(args.resume_from, model, optimizer, scheduler, device)
+        print(f"Resumed from epoch {start_epoch}; best loss={best_loss:.6f}")
+
+    for epoch in range(start_epoch, args.epochs):
         model.train()
-        total_loss = 0.0
+        total = 0.0
+        steps = 0
         for mixture, stems in loader:
-            mixture, stems = mixture.to(device), stems.to(device)
+            mixture = mixture.to(device, non_blocking=True).unsqueeze(1)
+            stems = stems.to(device, non_blocking=True)
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=not args.no_amp):
+                pred = model(mixture)
+                wave = F.l1_loss(pred, stems)
+                spec = spectral_loss(pred, stems)
+                loss = wave + args.spectral_weight * spec
 
-            mix_mag, mix_phase = stft_mag_phase(mixture)
-            mix_mag_in = mix_mag.unsqueeze(1)  # [batch, 1, freq, time]
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            scaler.step(optimizer)
+            scaler.update()
+            total += float(loss.detach().item())
+            steps += 1
 
-            masks = model(mix_mag_in)  # [batch, n_stems, freq, time]
-            predicted_mags = masks * mix_mag.unsqueeze(1)
+        scheduler.step()
+        avg = total / max(1, steps)
+        print(f"Epoch {epoch + 1}/{args.epochs} loss={avg:.6f} lr={scheduler.get_last_lr()[0]:.3e}")
 
-            target_mags = torch.stack([stft_mag_phase(stems[:, i])[0] for i in range(len(STEMS))], dim=1)
-
-            loss = F.l1_loss(predicted_mags, target_mags)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-
-        print(f"Epoch {epoch+1}/{args.epochs} — avg L1 loss: {total_loss / len(loader):.4f}")
-        torch.save(model.state_dict(), args.checkpoint_path)
-        print(f"Saved checkpoint to {args.checkpoint_path}")
+        save_checkpoint(args.checkpoint_path, model, optimizer, scheduler, epoch + 1, min(best_loss, avg))
+        if avg < best_loss:
+            best_loss = avg
+            best_path = str(Path(args.checkpoint_path).with_name("lightweight_unet_best.pt"))
+            save_checkpoint(best_path, model, optimizer, scheduler, epoch + 1, best_loss)
+            print(f"Saved new best checkpoint: {best_path}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--musdb-root", required=True, help="Path to unpacked MUSDB18 dataset")
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--checkpoint-path", default="lightweight_unet.pt")
-    args = parser.parse_args()
-    train(args)
+    p = argparse.ArgumentParser()
+    p.add_argument("--musdb-root", required=True)
+    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--batch-size", type=int, default=2)
+    p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--segments-per-track", type=int, default=20)
+    p.add_argument("--max-tracks", type=int, default=0)
+    p.add_argument("--num-workers", type=int, default=2)
+    p.add_argument("--spectral-weight", type=float, default=0.25)
+    p.add_argument("--checkpoint-path", default="lightweight_unet.pt")
+    p.add_argument("--resume-from", default="")
+    p.add_argument("--no-amp", action="store_true")
+    train(p.parse_args())
