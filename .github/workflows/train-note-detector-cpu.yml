@@ -1,91 +1,199 @@
 name: Train Note Detector (CPU, free runners)
 
-# This one is REAL training, not a smoke test — but deliberately scaled down
-# so it finishes on GitHub's free CPU-only runners in a reasonable time,
-# since there's no GPU available here. Expect a weaker model than the same
-# pipeline run on a GPU via colab_train_note_detector.ipynb with the larger
-# default settings — this workflow trades some accuracy for "runs
-# automatically on every push, for free, no Colab session needed."
+# CPU training workflow for the HZ CHORD AI note detector.
 #
-# Use the workflow_dispatch inputs to run a bigger pass by hand when you
-# want a stronger model without touching Colab (it'll just take longer).
+# The training pipeline:
+#
+#   1. Generate synthetic arpeggio audio
+#   2. Load audio with soundfile
+#   3. Create log-mel spectrograms with torchaudio
+#   4. Train the NoteDetector CNN
+#   5. Export the trained model to TFLite
+#   6. Copy the TFLite model into Android assets
+#   7. Upload the model as a GitHub Actions artifact
+#
+# Audio loading intentionally uses soundfile rather than
+# torchaudio.load(), because recent torchaudio releases use
+# TorchCodec for audio decoding.
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
     paths:
-      - 'training/note_detector/**'
-      - '.github/workflows/train-note-detector-cpu.yml'
+      - "training/note_detector/**"
+      - ".github/workflows/train-note-detector-cpu.yml"
+
   workflow_dispatch:
     inputs:
       examples_per_combo:
-        description: 'Synthetic examples per (root, quality, direction) combo'
+        description: "Synthetic examples per (root, quality, direction) combo"
         required: false
-        default: '5'
+        default: "5"
+
       epochs:
-        description: 'Training epochs'
+        description: "Training epochs"
         required: false
-        default: '10'
+        default: "10"
+
 
 jobs:
   train:
     runs-on: ubuntu-latest
-    timeout-minutes: 300 # generous ceiling; CPU training of a small CNN on a few thousand short clips should finish well under this
+
+    timeout-minutes: 300
+
     permissions:
-      contents: write # needed to commit the trained model back
+      contents: write
 
     steps:
+
+      # -------------------------------------------------------
+      # Checkout repository
+      # -------------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
 
+
+      # -------------------------------------------------------
+      # Python
+      # -------------------------------------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
-      - name: Install CPU-only torch + deps
+
+      # -------------------------------------------------------
+      # Install dependencies
+      #
+      # soundfile is explicitly installed because dataset.py
+      # uses soundfile to decode WAV files.
+      #
+      # TorchCodec is NOT required by our dataset loader.
+      # -------------------------------------------------------
+      - name: Install CPU-only torch + dependencies
         run: |
-          pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
-          pip install pretty_midi soundfile numpy ai-edge-torch
+          python -m pip install --upgrade pip
 
+          python -m pip install \
+            torch \
+            torchaudio \
+            --index-url https://download.pytorch.org/whl/cpu
+
+          python -m pip install \
+            pretty_midi \
+            soundfile \
+            numpy \
+            ai-edge-torch
+
+
+      # -------------------------------------------------------
+      # Verify audio dependency before starting training
+      # -------------------------------------------------------
+      - name: Verify Python audio dependencies
+        run: |
+          python - <<'PY'
+          import numpy
+          import soundfile
+          import torch
+          import torchaudio
+
+          print("NumPy:", numpy.__version__)
+          print("SoundFile:", soundfile.__version__)
+          print("Torch:", torch.__version__)
+          print("TorchAudio:", torchaudio.__version__)
+
+          print("Audio dependency check passed.")
+          PY
+
+
+      # -------------------------------------------------------
+      # Generate synthetic training dataset
+      # -------------------------------------------------------
       - name: Generate synthetic dataset
         working-directory: training/note_detector
         env:
           EXAMPLES_PER_COMBO: ${{ github.event.inputs.examples_per_combo || '5' }}
-        run: python3 generate_synthetic_arpeggios.py --output_dir data/arpeggios --examples_per_combo "$EXAMPLES_PER_COMBO"
+        run: |
+          python3 generate_synthetic_arpeggios.py \
+            --output_dir data/arpeggios \
+            --examples_per_combo "$EXAMPLES_PER_COMBO"
 
+
+      # -------------------------------------------------------
+      # Train model
+      # -------------------------------------------------------
       - name: Train
         working-directory: training/note_detector
         env:
           EPOCHS: ${{ github.event.inputs.epochs || '10' }}
-        run: python3 train.py --data_dir data/arpeggios --epochs "$EPOCHS" --batch_size 32 --output checkpoints/note_detector.pt | tee training_run_log.txt
+        run: |
+          python3 train.py \
+            --data_dir data/arpeggios \
+            --epochs "$EPOCHS" \
+            --batch_size 32 \
+            --output checkpoints/note_detector.pt \
+            | tee training_run_log.txt
 
+
+      # -------------------------------------------------------
+      # Export trained PyTorch model to TFLite
+      # -------------------------------------------------------
       - name: Export to TFLite
         working-directory: training/note_detector
-        run: python3 export_to_tflite.py --checkpoint checkpoints/note_detector.pt --output note_detector.tflite
+        run: |
+          python3 export_to_tflite.py \
+            --checkpoint checkpoints/note_detector.pt \
+            --output note_detector.tflite
 
+
+      # -------------------------------------------------------
+      # Copy model into Android assets
+      # -------------------------------------------------------
       - name: Copy model into the Android project's assets
         run: |
           mkdir -p app/src/main/assets/models
-          cp training/note_detector/note_detector.tflite app/src/main/assets/models/note_detector.tflite
 
+          cp \
+            training/note_detector/note_detector.tflite \
+            app/src/main/assets/models/note_detector.tflite
+
+
+      # -------------------------------------------------------
+      # Upload training artifacts
+      # -------------------------------------------------------
       - name: Upload training artifacts
         uses: actions/upload-artifact@v4
         with:
           name: note-detector-model
+
           path: |
             training/note_detector/note_detector.tflite
             training/note_detector/checkpoints/note_detector.pt
             training/note_detector/training_run_log.txt
 
+
+      # -------------------------------------------------------
+      # Commit updated Android TFLite model
+      # -------------------------------------------------------
       - name: Commit updated model, if it changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
           if ! git diff --quiet -- app/src/main/assets/models/note_detector.tflite; then
-            git add app/src/main/assets/models/note_detector.tflite
-            git commit -m "Retrain note_detector (CPU, free runners) [automated] [skip ci]"
+
+            git add \
+              app/src/main/assets/models/note_detector.tflite
+
+            git commit \
+              -m "Retrain note_detector (CPU, free runners) [automated] [skip ci]"
+
             git push
+
           else
+
             echo "No change in trained model — nothing to commit."
+
           fi
