@@ -1,4 +1,4 @@
-name: Extract Ichi ZIP to Repository
+name: Extract Ichi ZIP
 
 on:
   workflow_dispatch:
@@ -20,36 +20,45 @@ jobs:
 
           echo "Extracting Ichi.zip..."
 
-          rm -rf /tmp/ichi-extracted
-          mkdir -p /tmp/ichi-extracted
+          rm -rf /tmp/ichi
+          mkdir -p /tmp/ichi
 
-          unzip -o "Ichi.zip" -d /tmp/ichi-extracted
+          unzip -o Ichi.zip -d /tmp/ichi
 
-          echo "ZIP contents:"
-          find /tmp/ichi-extracted -maxdepth 4 -print
+          echo "Extracted files:"
+          find /tmp/ichi -maxdepth 4 -print
 
-          # Detect whether ZIP has one top-level folder
-          TOP_LEVEL_COUNT=$(find /tmp/ichi-extracted -mindepth 1 -maxdepth 1 | wc -l)
-          TOP_LEVEL_DIR=$(find /tmp/ichi-extracted -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          # Detect a single top-level directory
+          TOP_COUNT=$(find /tmp/ichi -mindepth 1 -maxdepth 1 | wc -l)
+          TOP_DIR=$(find /tmp/ichi -mindepth 1 -maxdepth 1 -type d | head -n 1)
 
-          if [ "$TOP_LEVEL_COUNT" -eq 1 ] && [ -n "$TOP_LEVEL_DIR" ]; then
-            echo "ZIP contains a top-level folder."
-            echo "Copying its contents to repository root..."
-
-            cp -R "$TOP_LEVEL_DIR"/. .
+          if [ "$TOP_COUNT" -eq 1 ] && [ -n "$TOP_DIR" ]; then
+            echo "Top-level folder detected: $TOP_DIR"
+            cp -R "$TOP_DIR"/. .
           else
-            echo "ZIP files are already at the root."
-            echo "Copying them directly..."
-
-            cp -R /tmp/ichi-extracted/. .
+            cp -R /tmp/ichi/. .
           fi
 
-          echo "Final repository structure:"
-          find . -maxdepth 4 -type f \
-            ! -path "./.git/*" \
-            | sort
+      - name: Protect workflow files
+        run: |
+          set -e
 
-      - name: Commit extracted files
+          # Save all workflow files temporarily
+          rm -rf /tmp/workflows
+          mkdir -p /tmp/workflows
+
+          if [ -d ".github/workflows" ]; then
+            cp -R .github/workflows/. /tmp/workflows/
+          fi
+
+          # Remove workflow files from this commit
+          rm -rf .github/workflows
+
+      - name: Remove ZIP
+        run: |
+          rm -f Ichi.zip
+
+      - name: Commit project files
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -57,8 +66,22 @@ jobs:
           git add -A
 
           if git diff --cached --quiet; then
-            echo "No changes detected."
+            echo "No changes to commit."
           else
-            git commit -m "Extract Ichi project into repository root"
+            git commit -m "Extract Ichi project"
             git push
           fi
+
+      - name: Restore workflow files
+        run: |
+          mkdir -p .github/workflows
+          cp -R /tmp/workflows/. .github/workflows/
+
+          echo "Workflow files restored locally."
+
+      - name: Show final structure
+        run: |
+          echo "Project structure:"
+          find . -maxdepth 4 -type f \
+            ! -path "./.git/*" \
+            | sort
