@@ -1,0 +1,64 @@
+name: Extract Ichi ZIP to Repository
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract Ichi.zip
+        run: |
+          set -e
+
+          echo "Extracting Ichi.zip..."
+
+          rm -rf /tmp/ichi-extracted
+          mkdir -p /tmp/ichi-extracted
+
+          unzip -o "Ichi.zip" -d /tmp/ichi-extracted
+
+          echo "ZIP contents:"
+          find /tmp/ichi-extracted -maxdepth 4 -print
+
+          # Detect whether ZIP has one top-level folder
+          TOP_LEVEL_COUNT=$(find /tmp/ichi-extracted -mindepth 1 -maxdepth 1 | wc -l)
+          TOP_LEVEL_DIR=$(find /tmp/ichi-extracted -mindepth 1 -maxdepth 1 -type d | head -n 1)
+
+          if [ "$TOP_LEVEL_COUNT" -eq 1 ] && [ -n "$TOP_LEVEL_DIR" ]; then
+            echo "ZIP contains a top-level folder."
+            echo "Copying its contents to repository root..."
+
+            cp -R "$TOP_LEVEL_DIR"/. .
+          else
+            echo "ZIP files are already at the root."
+            echo "Copying them directly..."
+
+            cp -R /tmp/ichi-extracted/. .
+          fi
+
+          echo "Final repository structure:"
+          find . -maxdepth 4 -type f \
+            ! -path "./.git/*" \
+            | sort
+
+      - name: Commit extracted files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No changes detected."
+          else
+            git commit -m "Extract Ichi project into repository root"
+            git push
+          fi
