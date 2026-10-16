@@ -7,15 +7,17 @@ name: Train Note Detector (CPU, free runners)
 #   1. Generate synthetic arpeggio audio
 #   2. Train the PyTorch note detector
 #   3. Convert the trained model to LiteRT/TFLite
-#   4. Copy the TFLite model into Android assets
-#   5. Upload the trained model as a GitHub Actions artifact
-#   6. Commit the updated TFLite model back to the repository
+#   4. Evaluate against GuitarSet (real guitar recordings + real note-level
+#      ground truth) and compare the score against the last committed model
+#   5. Only if the new model actually scored better: copy it into Android
+#      assets, commit, and push
 #
-# GitHub-hosted runners are CPU-only, so this workflow is intended
-# for automatic lightweight training and validation.
+# GitHub-hosted runners are CPU-only, so this workflow is intended for
+# automatic lightweight training and validation, not a from-scratch
+# state-of-the-art training run.
 #
-# The real/heavier training can still be performed using the
-# Colab/self-hosted training pipeline.
+# The real/heavier training can still be performed using the Colab/
+# self-hosted training pipeline — same gating applies there too.
 
 on:
   push:
@@ -36,6 +38,11 @@ on:
         description: "Training epochs"
         required: false
         default: "10"
+
+      eval_max_files:
+        description: "Number of GuitarSet files to evaluate against (0 = all 360)"
+        required: false
+        default: "15"
 
 
 jobs:
@@ -80,7 +87,9 @@ jobs:
           python -m pip install \
             numpy \
             soundfile \
-            pretty_midi
+            pretty_midi \
+            jams \
+            scikit-learn
 
 
       # -------------------------------------------------------
@@ -107,12 +116,16 @@ jobs:
           import torch
           import torchaudio
           import litert_torch
+          import jams
+          import sklearn
 
           print("NumPy:", numpy.__version__)
           print("SoundFile:", soundfile.__version__)
           print("PyTorch:", torch.__version__)
           print("TorchAudio:", torchaudio.__version__)
           print("LiteRT Torch:", getattr(litert_torch, "__version__", "installed"))
+          print("jams:", jams.__version__)
+          print("scikit-learn:", sklearn.__version__)
 
           print("Dependency check passed.")
           PY
@@ -157,7 +170,47 @@ jobs:
 
 
       # -------------------------------------------------------
-      # Convert PyTorch model to LiteRT/TFLite
+      # Cache GuitarSet across runs — it doesn't change, no reason to
+      # re-download several GB of audio on every push.
+      # -------------------------------------------------------
+      - name: Cache GuitarSet
+        id: cache-guitarset
+        uses: actions/cache@v4
+        with:
+          path: training/note_detector/data/guitarset
+          key: guitarset-v1
+
+      - name: Download GuitarSet (if not cached)
+        if: steps.cache-guitarset.outputs.cache-hit != 'true'
+        working-directory: training/note_detector
+        run: |
+          python3 prepare_guitarset.py --output-dir data/guitarset
+
+
+      # -------------------------------------------------------
+      # Evaluate against real GuitarSet recordings + ground truth,
+      # and decide whether this model actually improved.
+      # -------------------------------------------------------
+      - name: Evaluate against GuitarSet
+        working-directory: training/note_detector
+        env:
+          EVAL_MAX_FILES: ${{ github.event.inputs.eval_max_files || '15' }}
+        run: |
+          python3 evaluate_guitarset.py \
+            --checkpoint checkpoints/note_detector.pt \
+            --guitarset-root data/guitarset \
+            --max-files "$EVAL_MAX_FILES" \
+            --best-score-path best_score.json \
+            --results-path eval_results.json \
+            --gate-path gate_decision.txt
+
+          echo "Gate decision: $(cat gate_decision.txt)"
+
+
+      # -------------------------------------------------------
+      # Convert PyTorch model to LiteRT/TFLite — still done even if the
+      # gate says NOT_IMPROVED, so the artifact upload below always has
+      # something to attach for inspection.
       # -------------------------------------------------------
       - name: Export to TFLite
         working-directory: training/note_detector
@@ -181,10 +234,34 @@ jobs:
 
 
       # -------------------------------------------------------
-      # Copy TFLite model into Android project
+      # Upload artifacts — always, regardless of gate decision, so a
+      # NOT_IMPROVED run is still inspectable (useful for debugging why).
+      # -------------------------------------------------------
+      - name: Upload training artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: note-detector-model
+          path: |
+            training/note_detector/note_detector.tflite
+            training/note_detector/checkpoints/note_detector.pt
+            training/note_detector/training_run_log.txt
+            training/note_detector/eval_results.json
+
+
+      # -------------------------------------------------------
+      # Copy TFLite model into Android project — only if the gate says so.
+      # (The gate check runs inside this step's own shell, not via an `if:`
+      # condition, since the decision only exists as a file written a few
+      # steps up, not as a step output.)
       # -------------------------------------------------------
       - name: Copy model into Android assets
         run: |
+          GATE_DECISION=$(cat training/note_detector/gate_decision.txt)
+          if [ "$GATE_DECISION" = "NOT_IMPROVED" ]; then
+            echo "Model did not improve on GuitarSet eval — leaving the committed model as-is."
+            exit 0
+          fi
+
           mkdir -p app/src/main/assets/models
 
           cp \
@@ -196,38 +273,30 @@ jobs:
 
 
       # -------------------------------------------------------
-      # Upload artifacts
+      # Commit updated Android model + best_score.json, only if the gate
+      # said this model is actually better than the last committed one.
       # -------------------------------------------------------
-      - name: Upload training artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: note-detector-model
-          path: |
-            training/note_detector/note_detector.tflite
-            training/note_detector/checkpoints/note_detector.pt
-            training/note_detector/training_run_log.txt
-
-
-      # -------------------------------------------------------
-      # Commit updated Android model
-      # -------------------------------------------------------
-      - name: Commit updated model, if it changed
+      - name: Commit updated model, if it improved
         run: |
+          GATE_DECISION=$(cat training/note_detector/gate_decision.txt)
+
+          if [ "$GATE_DECISION" = "NOT_IMPROVED" ]; then
+            echo "Not committing — this run's model scored worse than the current best."
+            exit 0
+          fi
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          if ! git diff --quiet -- app/src/main/assets/models/note_detector.tflite; then
+          git add \
+            app/src/main/assets/models/note_detector.tflite \
+            training/note_detector/best_score.json
 
-            git add \
-              app/src/main/assets/models/note_detector.tflite
-
+          if git diff --staged --quiet; then
+            echo "No change to commit."
+          else
             git commit \
-              -m "Retrain note_detector (CPU, free runners) [automated] [skip ci]"
+              -m "Retrain note_detector (CPU, free runners) [automated] [skip ci] — GuitarSet F1: $(python3 -c "import json; print(json.load(open('training/note_detector/eval_results.json'))['frame_micro_f1'])")"
 
             git push
-
-          else
-
-            echo "No change in trained model — nothing to commit."
-
           fi

@@ -20,6 +20,10 @@ on:
         required: false
         type: boolean
         default: true
+      eval_max_tracks:
+        description: 'MUSDB18 test tracks to evaluate against (0 = all 50)'
+        required: false
+        default: '10'
 
 jobs:
   train:
@@ -67,6 +71,7 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           # PyTorch should normally come from the runner's CUDA environment.
           # Installing requirements here also makes a fresh runner reproducible.
+          # (requirements.txt now includes museval, used by the evaluation step below.)
           pip install -r training/stem_separator/requirements.txt
           ffmpeg_bin=$(python -c 'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())')
           echo "$(dirname "$ffmpeg_bin")" >> "$GITHUB_PATH"
@@ -79,6 +84,8 @@ jobs:
           print('GPU:', torch.cuda.get_device_name(0))
           import litert_torch
           print('litert_torch:', getattr(litert_torch, '__version__', 'installed'))
+          import museval
+          print('museval:', getattr(museval, '__version__', 'installed'))
           PY
           echo "$RUNNER_TEMP/hz-stem-venv/bin" >> "$GITHUB_PATH"
 
@@ -141,6 +148,28 @@ jobs:
             --checkpoint-path "$ckpt" \
             $resume_arg
 
+      # -------------------------------------------------------
+      # Evaluate against MUSDB18's REAL held-out test tracks (professionally
+      # separated reference stems) via museval, and decide whether this
+      # checkpoint is actually better than the one currently committed.
+      # best_score.json is committed alongside the model so this comparison
+      # persists across runs, not just within one.
+      # -------------------------------------------------------
+      - name: Evaluate against MUSDB18 test set
+        shell: bash
+        env:
+          EVAL_MAX_TRACKS: ${{ inputs.eval_max_tracks }}
+        run: |
+          set -euo pipefail
+          python training/stem_separator/evaluate_museval.py \
+            --checkpoint training/stem_separator/checkpoints/lightweight_unet.pt \
+            --musdb-root "$MUSDB_ROOT" \
+            --max-tracks "$EVAL_MAX_TRACKS" \
+            --best-score-path training/stem_separator/best_score.json \
+            --results-path training/stem_separator/eval_results.json \
+            --gate-path training/stem_separator/gate_decision.txt
+          echo "Gate decision: $(cat training/stem_separator/gate_decision.txt)"
+
       - name: Export and validate LiteRT model
         shell: bash
         run: |
@@ -161,6 +190,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          GATE_DECISION=$(cat training/stem_separator/gate_decision.txt)
+          if [ "$GATE_DECISION" = "NOT_IMPROVED" ]; then
+            echo "Model did not improve on MUSDB18 eval (SDR) — leaving the committed model as-is."
+            exit 0
+          fi
           mkdir -p app/src/main/assets/models
           cp training/stem_separator/stem_separator.tflite app/src/main/assets/models/stem_separator.tflite
 
@@ -173,17 +207,24 @@ jobs:
             training/stem_separator/stem_separator.tflite
             training/stem_separator/checkpoints/lightweight_unet.pt
             training/stem_separator/checkpoints/lightweight_unet_best.pt
+            training/stem_separator/eval_results.json
 
       - name: Commit validated model to repository
         shell: bash
         run: |
           set -euo pipefail
+          GATE_DECISION=$(cat training/stem_separator/gate_decision.txt)
+          if [ "$GATE_DECISION" = "NOT_IMPROVED" ]; then
+            echo "Not committing — this run scored worse than the current best (see eval_results.json in the uploaded artifact)."
+            exit 0
+          fi
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
-          git add app/src/main/assets/models/stem_separator.tflite
+          git add app/src/main/assets/models/stem_separator.tflite training/stem_separator/best_score.json
           if git diff --cached --quiet; then
             echo 'No model change to commit.'
             exit 0
           fi
-          git commit -m 'Update validated stem separator model [skip ci]'
+          SDR=$(python3 -c "import json; print(round(json.load(open('training/stem_separator/eval_results.json'))['overall_median_sdr'], 3))")
+          git commit -m "Update validated stem separator model [skip ci] — median SDR: ${SDR} dB"
           git push origin HEAD:${GITHUB_REF_NAME}
